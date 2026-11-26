@@ -80,6 +80,9 @@ interface RemoteSongsResponse {
  * MIoT 作为中立消费方，不解读 source_data 内部结构，不写死任何插件名。
  */
 export class OnlineSearcher {
+  /** 歌手列表搜索最多翻页数（接续补歌靠翻页拿到还没进队列的新歌） */
+  private static readonly ARTIST_SEARCH_MAX_PAGES = 3;
+
   private configManager: ConfigManager;
   private groupCoordinator?: GroupCoordinator;
 
@@ -401,7 +404,8 @@ export class OnlineSearcher {
       } catch (e) {
         songloft.log.warn('[OnlineSearcher] Failed to read imported song detail: ' + String(e));
       }
-      return pm.playStandaloneSong(fullSong, indexingManager);
+      return pm.playStandaloneSong(fullSong, indexingManager, undefined,
+        (artist, have, want, isCurrent) => this.topupQueueSongs(artist, have, want, indexingManager, isCurrent));
     }
 
     // 用返回的 url 构造完整播放 URL（相对路径，URLBuilder 会拼接 server_host 和 token）。
@@ -461,13 +465,292 @@ export class OnlineSearcher {
     return await this.playSearchResult(song, accountId, deviceId, minaService);
   }
 
+  // ===== 独立歌曲队列在线补歌（StandaloneTopup） =====
+  // 点播独立歌曲时 PlaylistManager 只会续播本地曲库的同歌手歌曲；只用在线音源的
+  // 用户曲库里往往只有刚命中的一首，队列 total=1、播完即停。这里复用外部搜索源的
+  // 列表搜索（与 topone 同一 provider 的 /api/search 列表端点）按歌手拉一批歌曲，
+  // 入库后以 remote 歌曲补进队列。全部失败静默返回空，绝不阻断原播放。
+
   /**
-   * 导入歌曲到 songloft 数据库
-   * @returns 导入成功后包含歌曲 id 和 url 的对象，失败返回 null
+   * 按歌手列表搜索。excludeKeys 是调用方已有歌曲的归一化键（title|artist），
+   * 命中排除集的结果不计入 want——接续补歌靠它翻页深挖「还没进队列」的新歌，
+   * 而不是每轮都把第一页的老结果再端回来。
    */
-  private async importSong(song: OnlineSearchResult): Promise<{ id: number; url: string } | null> {
-    // provider 字段原样映射，不解读、不补插件名
-    const remoteItem: RemoteSongItem = {
+  private async searchArtistSongs(
+    artist: string,
+    want: number,
+    excludeKeys?: Set<string>,
+  ): Promise<OnlineSearchResult[]> {
+    const target = (artist || '').trim();
+    if (!target || want <= 0) return [];
+    const sources = await this.getEnabledSources();
+    if (sources.length === 0) return [];
+    const config = await this.configManager.getConfig();
+    const timeoutMs = Math.min((config.external_search_timeout > 0 ? config.external_search_timeout : 6) * 1000, 8000);
+    for (const source of sources) {
+      try {
+        const results = await this.searchArtistOnSource(source, target, want, timeoutMs, excludeKeys);
+        if (results.length > 0) return results;
+      } catch (e) {
+        songloft.log.warn('[OnlineSearcher] Artist list search failed for source "' + (source.name || source.url) + '": ' + String(e));
+      }
+    }
+    return [];
+  }
+
+  /**
+   * 向单个源的列表端点按歌手搜索。列表端点由 topone 地址推导
+   * （.../api/search/topone → .../api/search），且必须是宿主 jsplugin 相对/绝对
+   * 地址（entryPath 从地址解析，不写死任何插件名）；形状不符直接放弃该源。
+   * 平台逐个尝试、逐页翻（最多 ARTIST_SEARCH_MAX_PAGES 页），某平台某页返回
+   * 0 条即视为该平台耗尽；凑够 want 首「未被排除」的结果即停。
+   * 结果按署名匹配过滤。每发一次请求都打一条响应摘要日志（code / data 键名 /
+   * 条数 / 首项键名），响应形状与预期不符时能直接从宿主日志定位。
+   */
+  private async searchArtistOnSource(
+    source: ExternalSearchSource,
+    artist: string,
+    want: number,
+    timeoutMs: number,
+    excludeKeys?: Set<string>,
+  ): Promise<OnlineSearchResult[]> {
+    const baseUrl = await this.resolveSourceUrl(source);
+    if (!baseUrl) return [];
+    const listUrl = baseUrl.replace(/\/search\/topone\/?$/, '/search');
+    if (listUrl === baseUrl) return [];
+    const entryMatch = /\/jsplugin\/([^/]+)\//.exec(baseUrl);
+    if (!entryMatch) return [];
+    const entryPath = entryMatch[1];
+    const authToken = await this.resolveSourceToken(source);
+    const sourceLabel = source.name || entryPath;
+
+    const collected: OnlineSearchResult[] = [];
+    const seenKeys = new Set<string>();
+    const exhaustedPlatforms = new Set<string>();
+    for (let page = 1; page <= OnlineSearcher.ARTIST_SEARCH_MAX_PAGES; page++) {
+      if (collected.length >= want) break;
+      for (const platform of ['tx', 'kg', 'kw', 'wy', 'mg']) {
+        if (collected.length >= want) break;
+        if (exhaustedPlatforms.has(platform)) continue;
+        const resp = await this.fetchJsonWithTimeout(listUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: authToken },
+          body: JSON.stringify({ keyword: artist, source_id: platform, type: 'song', page, quality: '320k' }),
+        }, timeoutMs);
+        // 响应形状兼容：data 可能是 {results:[...]} / {list:[...]} / {songs:[...]}
+        // 或直接数组。字段名未经 provider 文档确认，以实测日志为准逐步收敛。
+        const data = resp?.code === 0 ? resp.data : undefined;
+        const items: any[] = Array.isArray(data) ? data
+          : (data?.results || data?.list || data?.songs || []);
+        const dataKeys = data === undefined ? 'none'
+          : Array.isArray(data) ? '(array)'
+          : (data && typeof data === 'object' ? Object.keys(data).join(',') : typeof data);
+        const itemKeys = items.length > 0 && items[0] && typeof items[0] === 'object'
+          ? Object.keys(items[0]).join(',') : '';
+        songloft.log.info(`[StandaloneTopup] list search source="${sourceLabel}" platform=${platform} page=${page} code=${resp ? resp.code : 'no-response'} dataKeys=${dataKeys} items=${items.length}${itemKeys ? ' itemKeys=' + itemKeys : ''}`);
+        if (items.length === 0) {
+          exhaustedPlatforms.add(platform);
+          continue;
+        }
+        for (const item of items) {
+          if (collected.length >= want) break;
+          if (!item?.title || !item.source_data) continue;
+          if (!this.artistMatches(item.artist || '', artist)) continue;
+          const converted = this.listItemToResult(item, entryPath);
+          if (!converted) continue;
+          const normKey = `${(converted.title || '').trim().toLowerCase()}|${(converted.artist || '').trim().toLowerCase()}`;
+          if (excludeKeys && excludeKeys.has(normKey)) continue;
+          const key = converted.dedup_key || normKey;
+          if (seenKeys.has(key) || seenKeys.has(normKey)) continue;
+          seenKeys.add(key);
+          seenKeys.add(normKey);
+          collected.push(converted);
+        }
+      }
+    }
+    return collected;
+  }
+
+  /** 列表项 → 搜索候选：补 topone 响应才带的 plugin_entry_path 与 dedup_key */
+  private listItemToResult(item: any, entryPath: string): OnlineSearchResult | null {
+    const sourceData = item.source_data;
+    if (!sourceData || typeof sourceData !== 'object') return null;
+    const info = sourceData.songInfo || {};
+    const platform = String(sourceData.platform || info.source || '');
+    // 与 provider 侧 dedup 规则对齐：kg 优先 albumAudioId，其次 songmid/musicId/hash/copyrightId
+    const idPart = (platform === 'kg' && info.albumAudioId) || info.songmid || info.musicId || info.hash || info.copyrightId || '';
+    return {
+      title: item.title,
+      artist: item.artist || '',
+      album: item.album || '',
+      duration: item.duration || 0,
+      cover_url: item.cover_url || '',
+      plugin_entry_path: entryPath,
+      source_data: sourceData,
+      dedup_key: platform && idPart ? `${platform}:${idPart}` : '',
+    };
+  }
+
+  /** 署名匹配：全等、分隔符拆分后的任一段全等，或双向包含（短方至少 2 字） */
+  private artistMatches(candidate: string, target: string): boolean {
+    const norm = (s: string) => (s || '').trim().toLowerCase().replace(/\s+/g, '');
+    const c = norm(candidate);
+    const t = norm(target);
+    if (!c || !t) return false;
+    if (c === t) return true;
+    const parts = (candidate || '').split(/[,，、/&;；·]/).map(norm).filter(Boolean);
+    if (parts.includes(t)) return true;
+    return Math.min(c.length, t.length) >= 2 && (c.includes(t) || t.includes(c));
+  }
+
+  /** 带总期限的 JSON 请求：超时/解析失败一律返回 null（与 searchOne 同款竞速守卫） */
+  private async fetchJsonWithTimeout(url: string, init: any, timeoutMs: number): Promise<any | null> {
+    let finished = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => { finished = true; reject(new Error('AbortError')); }, timeoutMs);
+    });
+    try {
+      const request = (async (): Promise<any | null> => {
+        const resp = await fetch(url, init);
+        if (finished) return null;
+        const text = await resp.text();
+        if (finished) return null;
+        try {
+          return JSON.parse(text);
+        } catch {
+          return null;
+        }
+      })();
+      return await Promise.race([request, timeoutPromise]);
+    } catch {
+      return null;
+    } finally {
+      finished = true;
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
+  /**
+   * 批量导入搜索候选到 songloft 数据库（/api/v1/songs/remote 数组形式）。
+   * 批量响应按 dedup_key / 标题+歌手 / 顺序对齐；未对齐的逐首回退 importSong。
+   * @returns 成功入库的歌曲（含真实 id/url 与候选元信息），失败项静默跳过
+   */
+  async importSongs(
+    songs: OnlineSearchResult[],
+  ): Promise<Array<{ id: number; url: string; title: string; artist: string; album: string; duration: number; cover_url: string }>> {
+    const out: Array<{ id: number; url: string; title: string; artist: string; album: string; duration: number; cover_url: string }> = [];
+    if (!songs.length) return out;
+    const matched = new Array<boolean>(songs.length).fill(false);
+    try {
+      const pluginToken = await songloft.plugin.getToken();
+      const serverHost = await getHostAPIBaseUrl();
+      const fetchResp = await fetch(serverHost + '/api/v1/songs/remote', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${pluginToken}` },
+        body: JSON.stringify(songs.map((s) => this.toRemoteItem(s))),
+      });
+      const text = await fetchResp.text();
+      let result: RemoteSongsResponse | null = null;
+      try {
+        result = JSON.parse(text) as RemoteSongsResponse;
+      } catch {
+        songloft.log.warn('[OnlineSearcher] Failed to parse batch remote songs response: ' + text);
+      }
+      const returned = result?.songs || [];
+      for (let i = 0; i < songs.length; i++) {
+        const src = songs[i];
+        const hit = returned.find((r) => !!src.dedup_key && r.dedup_key === src.dedup_key)
+          || returned.find((r) => r.title === src.title && r.artist === (src.artist || ''))
+          || (returned.length === songs.length ? returned[i] : undefined);
+        if (hit && hit.id) {
+          matched[i] = true;
+          out.push({ id: hit.id, url: hit.url || '', title: src.title, artist: src.artist || '', album: src.album || '', duration: src.duration || 0, cover_url: src.cover_url || '' });
+        }
+      }
+    } catch (e) {
+      songloft.log.warn('[OnlineSearcher] Batch import fetch error: ' + String(e));
+    }
+    // 批量未覆盖到的逐首回退（单首 importSong 内部自带已存在查找）
+    for (let i = 0; i < songs.length; i++) {
+      if (matched[i]) continue;
+      try {
+        const one = await this.importSong(songs[i]);
+        if (one && one.id) {
+          out.push({ id: one.id, url: one.url || '', title: songs[i].title, artist: songs[i].artist || '', album: songs[i].album || '', duration: songs[i].duration || 0, cover_url: songs[i].cover_url || '' });
+        }
+      } catch (e) {
+        songloft.log.warn('[OnlineSearcher] Topup import fallback failed for "' + songs[i].title + '": ' + String(e));
+      }
+    }
+    return out;
+  }
+
+  /**
+   * 独立歌曲队列补歌：按歌手在线搜索 → 入库 → 返回可入队的完整歌曲对象。
+   * 供 PlaylistManager.playStandaloneSong 的首轮补歌与接续补歌共用；
+   * 任何失败返回已得部分或空数组。无论结果如何都打一条 round 汇总日志
+   * （含 0 首与原因），杜绝静默无日志。
+   */
+  async topupQueueSongs(
+    artist: string,
+    have: Array<{ id: number; title: string; artist?: string }>,
+    want: number,
+    indexingManager?: IndexingManager,
+    isCurrent: () => boolean = () => true,
+  ): Promise<any[]> {
+    const key = (title: string, a: string) => `${(title || '').trim().toLowerCase()}|${(a || '').trim().toLowerCase()}`;
+    const haveKeys = new Set(have.map((s) => key(s.title, s.artist || '')));
+    let searched = 0;
+    let freshCount = 0;
+    let importedCount = 0;
+    const done = (out: any[], reason: string): any[] => {
+      songloft.log.info(`[StandaloneTopup] round artist="${artist}" want=${want} searched=${searched} fresh=${freshCount} imported=${importedCount} returned=${out.length} reason=${reason}`);
+      return out;
+    };
+    if (want <= 0 || !isCurrent()) return done([], 'not-current-or-no-want');
+    // 排除集传进搜索层：翻页时跳过队列里已有的歌，深挖后面的新歌。
+    const results = await this.searchArtistSongs(artist, want + 5, haveKeys);
+    searched = results.length;
+    if (!results.length || !isCurrent()) return done([], results.length ? 'not-current' : 'search-empty');
+    const fresh = results.filter((r) => !haveKeys.has(key(r.title, r.artist || '')));
+    freshCount = fresh.length;
+    if (!fresh.length) return done([], 'all-duplicates');
+    const imported = await this.importSongs(fresh.slice(0, want + 5));
+    importedCount = imported.length;
+    if (!imported.length) return done([], 'import-failed');
+    const out: any[] = [];
+    const seenIds = new Set(have.map((s) => s.id));
+    const seenKeys = new Set(haveKeys);
+    for (const imp of imported) {
+      if (out.length >= want || !isCurrent()) break;
+      const k = key(imp.title, imp.artist);
+      if (seenIds.has(imp.id) || seenKeys.has(k)) continue;
+      seenIds.add(imp.id);
+      seenKeys.add(k);
+      let full: any = null;
+      try {
+        full = await songloft.songs.getById(imp.id);
+      } catch (e) {
+        songloft.log.warn('[OnlineSearcher] Topup getById failed id=' + imp.id + ': ' + String(e));
+      }
+      out.push(full && full.url ? full : {
+        id: imp.id, url: imp.url, type: 'remote',
+        title: imp.title, artist: imp.artist, album: imp.album,
+        duration: imp.duration, cover_url: imp.cover_url,
+      });
+      if (indexingManager) {
+        try {
+          indexingManager.addImportedSong({ id: imp.id, title: imp.title, artist: imp.artist, album: imp.album });
+        } catch { /* 索引增量失败不影响入队 */ }
+      }
+    }
+    return done(out, out.length ? 'ok' : 'all-duplicates');
+  }
+
+  /** 搜索候选 → 宿主 /api/v1/songs/remote 请求项（provider 字段原样映射，不解读、不补插件名） */
+  private toRemoteItem(song: OnlineSearchResult): RemoteSongItem {
+    return {
       title: song.title,
       artist: song.artist || '',
       album: song.album || '',
@@ -482,6 +765,14 @@ export class OnlineSearcher {
       lyric: song.lyric || '',
       lyric_source: song.lyric_source || '',
     };
+  }
+
+  /**
+   * 导入歌曲到 songloft 数据库
+   * @returns 导入成功后包含歌曲 id 和 url 的对象，失败返回 null
+   */
+  private async importSong(song: OnlineSearchResult): Promise<{ id: number; url: string } | null> {
+    const remoteItem = this.toRemoteItem(song);
 
     try {
       const pluginToken = await songloft.plugin.getToken();

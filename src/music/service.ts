@@ -247,6 +247,12 @@ export class MusicCommandService {
     this.groupCoordinator = groupCoordinator;
     this.onlineSearcher = new OnlineSearcher(configManager, groupCoordinator);
     this.memoryService = memoryService || new MemoryService();
+    // 接续补歌（StandaloneTopup 续）：把在线按歌手补歌能力注入全部播放器，
+    // 临时歌手队列 order 模式播完时自动续拉下一批，不停播。经 map 注入，
+    // 插件重启后恢复出的临时队列同样生效。
+    this.playlistManagerMap.setContinuationTopupProvider(
+      (artist, have, want, isCurrent) => this.onlineSearcher.topupQueueSongs(artist, have, want, this.indexingManager, isCurrent),
+    );
   }
 
   // ===== 公开方法 =====
@@ -1763,7 +1769,8 @@ export class MusicCommandService {
     standalone: StandaloneSongCandidate,
     pm: PlaylistManager,
   ): Promise<boolean> {
-    const ok = await pm.playStandaloneSong(standalone as any, this.indexingManager);
+    const ok = await pm.playStandaloneSong(standalone as any, this.indexingManager, undefined,
+      (artist, have, want, isCurrent) => this.onlineSearcher.topupQueueSongs(artist, have, want, this.indexingManager, isCurrent));
     if (!ok) {
       songloft.log.error('[MusicCommandService] Failed to play standalone song: ' + standalone.title + ' - ' + standalone.artist);
       return false;

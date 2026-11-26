@@ -351,6 +351,23 @@ interface Song {
   cache_hash?: string;
 }
 
+/**
+ * 独立歌曲队列在线补歌回调（StandaloneTopup）：本地同歌手队列过短时，
+ * 由调用方按歌手返回可追加的歌曲（须已入库、带真实 id/url）。
+ * 返回空数组或抛错都只表示不补歌，绝不阻断原队列播放。
+ */
+export type StandaloneTopupProvider = (
+  artist: string,
+  have: Song[],
+  want: number,
+  isCurrent: () => boolean,
+) => Promise<Song[]>;
+
+/** 本地队列（含命中歌曲）少于此数才触发在线补歌 */
+const STANDALONE_TOPUP_THRESHOLD = 8;
+/** 在线补歌的目标队列总数 */
+const STANDALONE_TOPUP_TARGET = 15;
+
 /** 宿主API歌单歌曲响应 */
 interface PlaylistSongsResponse {
   code: number;
@@ -451,6 +468,12 @@ export class PlaylistManager {
   private tempArtistQuery: string = ''; // 临时歌手歌单的原始搜索词，用于持久化和恢复
   private tempArtistExact = false;
   private tempStartSongId = 0;
+  // 接续补歌（StandaloneTopup 续）：临时歌手队列 order 模式播完不该停，由注入的
+  // 提供者按歌手在线再拉一批新歌追加队尾。提供者经 PlaylistManagerMap 统一注入
+  // （MusicCommandService 构造时注册），恢复出的临时队列同样带得上。
+  private continuationTopup?: StandaloneTopupProvider;
+  private continuationRefillPromise: Promise<number> | null = null; // 进行中的一轮补歌，并发调用共享
+  private continuationExhausted = false; // 本队列已确认在线无新歌（补到 0 首），不再重试
   private pendingTempArtist: string = ''; // 待恢复的临时歌手名（索引就绪后自动恢复）
   private _lastLoadNotFound: boolean = false; // 上次 loadPlaylistSongs 失败是否因歌单不存在(ID 过期)
   private hardStopped: boolean = false; // 上次暂停被设备忽略而升级为 stop：设备端已无媒体上下文，续播需重推 URL
@@ -577,6 +600,11 @@ export class PlaylistManager {
     this.announceOnSongChange = enabled;
   }
 
+  /** 注入接续补歌提供者（见 continuationTopup 字段说明）。 */
+  setContinuationTopupProvider(provider: StandaloneTopupProvider | undefined): void {
+    this.continuationTopup = provider;
+  }
+
   /** 播放歌单；randomStart 只选择起点。 */
   async play(playlistId: number, startIndex?: number, mode?: PlayMode, opts?: { randomStart?: boolean; seekSeconds?: number; isCurrent?: () => boolean }): Promise<boolean> {
     return this.startPlaylist(playlistId, { startIndex, mode, ...opts });
@@ -679,6 +707,8 @@ export class PlaylistManager {
     this.playMode = normalizePlayMode(mode);
     this.randomPlayed = new Set();
     this.clearPendingNextIndex();
+    // 新队列重新给接续补歌一次机会（上一队列的「目录耗尽」结论不带过来）
+    this.continuationExhausted = false;
 
     const ok = await this.playCurrent({ isCurrent: isCurrent });
     if (!ok) {
@@ -696,6 +726,7 @@ export class PlaylistManager {
     song: Song,
     indexingManager: import('../indexing/manager').IndexingManager,
     taskCurrent?: () => boolean,
+    topup?: StandaloneTopupProvider,
   ): Promise<boolean> {
     const revision = this.getPlaybackRevision();
     const epoch = this.playbackEpoch;
@@ -728,6 +759,39 @@ export class PlaylistManager {
         return true;
       }),
     ];
+    // 本次点播带来的补歌提供者同时登记为接续补歌提供者：队列播完时靠它续拉
+    // 下一批（见 refillArtistQueueInternal）。map 注入的是同一个提供者，互不冲突。
+    if (topup) this.continuationTopup = topup;
+    // StandaloneTopup：本地队列过短时（只用在线音源的用户曲库里同歌手往往只有
+    // 命中这一首）由调用方在线按歌手补歌，让单曲点播也能连续播放。单曲播放 /
+    // 单曲循环是用户明确选定的单首语义，不补；补歌失败静默降级为原队列。
+    if (
+      topup && artist && song.type !== 'radio' &&
+      mode !== 'single' && mode !== 'singlePlay' &&
+      queue.length < STANDALONE_TOPUP_THRESHOLD
+    ) {
+      try {
+        const extra = await topup(artist, queue, STANDALONE_TOPUP_TARGET - queue.length, isCurrent);
+        if (!isCurrent()) return false;
+        const seenKeys = new Set(queue.map((s) => `${(s.title || '').trim().toLowerCase()}|${(s.artist || '').trim().toLowerCase()}`));
+        let added = 0;
+        for (const candidate of extra || []) {
+          if (!candidate || candidate.id === undefined || seen.has(candidate.id)) continue;
+          const key = `${(candidate.title || '').trim().toLowerCase()}|${(candidate.artist || '').trim().toLowerCase()}`;
+          if (seenKeys.has(key)) continue;
+          seen.add(candidate.id);
+          seenKeys.add(key);
+          queue.push(candidate);
+          added++;
+        }
+        // 无论补到几首都要留痕：0 首时靠这条（及提供者侧的 round 汇总行）定位
+        // 是没搜到、全重复还是导入失败，不再出现「静默无日志」。
+        songloft.log.info(`[StandaloneTopup] initial topup for artist "${artist}": added=${added} (queue total=${queue.length})`);
+      } catch (e) {
+        songloft.log.warn('[StandaloneTopup] topup failed, continuing with local queue: ' + String(e));
+      }
+    }
+    if (!isCurrent()) return false;
     // playWithSongs 会改变 revision，传入的任务守卫仍由它贯穿实际推流。
     // 不入库的临时直链可能过期，不持久化它的歌手队列恢复标记。
     return this.playWithSongs(
@@ -739,6 +803,112 @@ export class PlaylistManager {
       taskCurrent,
       true,
     );
+  }
+
+  /**
+   * 接续补歌是否可能生效（同步判定）。advanceToNextInternal 只在为真时才
+   * await 补歌：普通队列/无提供者时不引入任何新的异步边界，保持原有切歌
+   * 时序（issue 130 的「新播放作废排队停止」依赖推进路径的既有交错）。
+   */
+  private canContinuationRefill(): boolean {
+    return !!this.continuationTopup &&
+      this.playlistId === this.tempId &&
+      !!(this.tempArtistQuery || '').trim() &&
+      this.playMode === 'order' &&
+      !this.continuationExhausted;
+  }
+
+  /**
+   * 接续补歌入口：同一时刻只跑一轮，并发调用（最后一首起播时的后台预取与
+   * 播完时的兜底）共享同一个 Promise，避免重复搜索/导入。返回实际追加数。
+   */
+  private refillArtistQueue(reason: 'prefetch' | 'exhausted'): Promise<number> {
+    if (this.continuationRefillPromise) return this.continuationRefillPromise;
+    const pending = this.refillArtistQueueInternal(reason).then(
+      (added) => {
+        if (this.continuationRefillPromise === pending) this.continuationRefillPromise = null;
+        return added;
+      },
+      (e) => {
+        if (this.continuationRefillPromise === pending) this.continuationRefillPromise = null;
+        throw e;
+      },
+    );
+    this.continuationRefillPromise = pending;
+    return pending;
+  }
+
+  /**
+   * 接续补歌实现：临时歌手队列在 order 模式下快播完/播完时，按歌手在线再拉
+   * 一批新歌（提供者内部按队列现有歌曲去重、翻页深挖）追加到队尾继续播。
+   * 只追加、不改现有下标；队列在拉歌期间被换掉（新点播/外部接管）则整轮丢弃。
+   * 一轮补到 0 首 = 在线目录对该歌手已无新歌，置 continuationExhausted，
+   * 本队列不再重试，队列按原逻辑自然结束。
+   */
+  private async refillArtistQueueInternal(reason: 'prefetch' | 'exhausted'): Promise<number> {
+    const provider = this.continuationTopup;
+    const artist = (this.tempArtistQuery || '').trim();
+    if (!provider || !artist) return 0;
+    if (this.playlistId !== this.tempId) return 0;
+    if (this.playMode !== 'order') return 0;
+    if (this.continuationExhausted) return 0;
+    const songsRef = this.songs;
+    const epoch = this.playbackEpoch;
+    const isCurrent = () => !this.externalPlayback && epoch === this.playbackEpoch &&
+      this.songs === songsRef && this.playlistId === this.tempId &&
+      (this.tempArtistQuery || '').trim() === artist;
+    let extra: Song[] = [];
+    try {
+      extra = await provider(artist, [...this.songs], STANDALONE_TOPUP_TARGET, isCurrent) || [];
+    } catch (e) {
+      songloft.log.warn(`[StandaloneTopup] continuation refill (${reason}) failed for artist "${artist}": ${String(e)}`);
+      return 0;
+    }
+    if (!isCurrent()) {
+      songloft.log.info(`[StandaloneTopup] continuation refill (${reason}) for artist "${artist}" discarded: queue changed during fetch`);
+      return 0;
+    }
+    const seenIds = new Set(this.songs.map((s) => s.id));
+    const seenKeys = new Set(this.songs.map((s) => `${(s.title || '').trim().toLowerCase()}|${(s.artist || '').trim().toLowerCase()}`));
+    let added = 0;
+    for (const candidate of extra) {
+      if (!candidate || candidate.id === undefined || seenIds.has(candidate.id)) continue;
+      const key = `${(candidate.title || '').trim().toLowerCase()}|${(candidate.artist || '').trim().toLowerCase()}`;
+      if (seenKeys.has(key)) continue;
+      seenIds.add(candidate.id);
+      seenKeys.add(key);
+      this.songs.push(candidate);
+      added++;
+    }
+    if (added > 0) {
+      this.totalSongs = this.songs.length;
+      // 已定好的下一首是按旧队长算的（order 末尾定时为 -1），追加后作废重算，
+      // 否则自动切歌仍会按「没有下一首」停掉。追加只发生在队尾，不影响预热的
+      // 其它下标；这里清掉后 reserveNextIndex 会按新队长重新定。
+      this.clearPendingNextIndex();
+      songloft.log.info(`[StandaloneTopup] continuation refill (${reason}) added ${added} songs by artist "${artist}" (queue total=${this.songs.length})`);
+      try {
+        await this.persistState();
+      } catch (e) {
+        songloft.log.warn('[StandaloneTopup] continuation refill persistState failed: ' + String(e));
+      }
+    } else {
+      this.continuationExhausted = true;
+      songloft.log.info(`[StandaloneTopup] continuation refill (${reason}) added 0 songs by artist "${artist}": no new songs online, queue will end naturally`);
+    }
+    return added;
+  }
+
+  /**
+   * 后台预取触发点：临时歌手队列在 order 模式下播到最后一首时，提前在后台
+   * 补下一批（搜索+导入要几秒，等播完再补会有明显停顿）。不阻塞起播。
+   */
+  private maybeRefillArtistQueue(): void {
+    if (!this.canContinuationRefill()) return;
+    if (this.currentIndex < this.songs.length - 1) return;
+    void this.refillArtistQueue('prefetch').catch((e) => {
+      songloft.log.warn('[StandaloneTopup] background refill error: ' + String(e));
+    });
   }
 
   /**
@@ -1694,6 +1864,8 @@ export class PlaylistManager {
     this.state = 'idle';
     this.randomPlayed = new Set();
     this.clearPendingNextIndex();
+    // 恢复出的临时队列是新生命周期：接续补歌重新可用（提供者由 map 在建 manager 时注入）
+    this.continuationExhausted = false;
   }
 
   // ===== 私有方法 =====
@@ -1966,6 +2138,9 @@ export class PlaylistManager {
     }
 
     this.prefetchNextSong();
+
+    // 接续补歌预取：临时歌手队列播到最后一首时，后台先把下一批拉好追加队尾。
+    this.maybeRefillArtistQueue();
 
     // 起播确认：ubus 报成功≠设备真的拉到了流（例如音源解析失败时后端 502，音箱拉不到会 TTS
     // 「播放失败，换一首试试吧」并停下）。等一小段起播缓冲窗口后回读状态，未起播就跳下一首。
@@ -3718,7 +3893,19 @@ export class PlaylistManager {
       return;
     }
 
-    const nextIdx = this.getNextPlayableIndex(afterLandingFailure);
+    let nextIdx = this.getNextPlayableIndex(afterLandingFailure);
+    if (nextIdx < 0 && !afterLandingFailure && this.canContinuationRefill()) {
+      // 接续补歌兜底：临时歌手队列播完先别停，在线再拉一批同歌手新歌接着播。
+      // 正常情况下最后一首起播时的后台预取已经补好，这里只兜「恢复后直接落在
+      // 末尾」「预取失败」等场景。补到新歌且队列没被别的动作接管才重新定下一首。
+      const finishedIndex = this.currentIndex;
+      const finishedSong = this.songs[finishedIndex];
+      const added = await this.refillArtistQueue('exhausted');
+      if (added > 0 && this.state === 'playing' &&
+        this.currentIndex === finishedIndex && this.songs[finishedIndex] === finishedSong) {
+        nextIdx = this.getNextPlayableIndex(afterLandingFailure);
+      }
+    }
     if (nextIdx < 0) {
       if (afterLandingFailure || this.pendingNextIndex >= 0) {
         songloft.log.warn('[PlaylistManager] No playable next song, stopping playback');
@@ -4051,10 +4238,23 @@ export class PlaylistManagerMap {
   private groupsSnapshot: DeviceGroup[] = [];
   private minaService: MinaService;
   private configManager: ConfigManager;
+  private continuationTopupProvider?: StandaloneTopupProvider;
 
   constructor(minaService: MinaService, configManager: ConfigManager) {
     this.minaService = minaService;
     this.configManager = configManager;
+  }
+
+  /**
+   * 注入接续补歌提供者（StandaloneTopup 续）：应用到现有全部 manager，
+   * 后续 getOrCreate 新建的 manager 也自动带上——这样插件重启后经
+   * restoreTempPlaylists 恢复出的临时歌手队列同样能接续补歌。
+   */
+  setContinuationTopupProvider(provider: StandaloneTopupProvider | undefined): void {
+    this.continuationTopupProvider = provider;
+    for (const manager of this.managers.values()) {
+      manager.setContinuationTopupProvider(provider);
+    }
   }
 
   /**
@@ -4160,6 +4360,9 @@ export class PlaylistManagerMap {
 
     const manager = new PlaylistManager(primary.account_id, primary.device_id, this.minaService, this.configManager);
     manager.setTargets(targets);
+    if (this.continuationTopupProvider) {
+      manager.setContinuationTopupProvider(this.continuationTopupProvider);
+    }
 
     // 从主设备配置恢复播放列表状态（本身不发设备指令）
     const resumeAnchor = await this.restoreFromConfig(manager, primary.account_id, primary.device_id);
